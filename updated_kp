@@ -1,0 +1,1741 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// ============================================================
+// PCA9685 SETTINGS
+// ============================================================
+
+constexpr int SDA_PIN = 22;
+constexpr int SCL_PIN = 23;
+
+constexpr uint8_t PCA_ADDRESS = 0x40;
+constexpr uint8_t SERVO_COUNT = 10;
+
+constexpr uint16_t SERVO_MIN_US = 600;
+constexpr uint16_t SERVO_MAX_US = 2400;
+constexpr uint16_t SERVO_FREQUENCY_HZ = 50;
+
+
+// ============================================================
+// MOVEMENT SETTINGS
+// ============================================================
+
+// Servo moves 1 degree at a time
+constexpr int MOVE_STEP_DEGREES = 1;
+
+// Delay between every 1 degree movement
+constexpr int MOVE_STEP_DELAY_MS = 15;
+
+// Delay after each gait state
+constexpr int GAIT_FRAME_DELAY_MS = 500;
+
+// Big delay for sequential state
+constexpr int SEQUENTIAL_DELAY_MS = 1500;
+
+
+// ============================================================
+// PCA9685 OBJECT
+// ============================================================
+
+Adafruit_PWMServoDriver pwm(PCA_ADDRESS, Wire);
+
+
+// ============================================================
+// SERVO MAP
+// ============================================================
+
+// Servo 0 = Left ankle roll
+// Servo 1 = Left ankle pitch
+// Servo 2 = Left knee pitch
+// Servo 3 = Left hip pitch
+// Servo 4 = Left hip roll
+
+// Servo 5 = Right hip roll
+// Servo 6 = Right hip pitch
+// Servo 7 = Right knee pitch
+// Servo 8 = Right ankle pitch
+// Servo 9 = Right ankle roll
+
+
+// ============================================================
+// DEFAULT KP17 POSE
+// ============================================================
+
+const int KP_DEFAULT_POSE[SERVO_COUNT] = {
+  42, 120, 45, 80, 90,
+  100, 90, 135, 50, 60
+};
+
+
+// ============================================================
+// RIGHT LEG GAIT
+// ONLY R1, R2, R3
+// ============================================================
+
+// R0 = DEFAULT
+const int RIGHT_FRAME_0[SERVO_COUNT] = {
+  42, 120, 45, 60, 90,
+  100, 90, 135, 50, 60
+};
+
+
+// ------------------------------------------------------------
+// R1 = SHIFT BODY LEFT
+// ------------------------------------------------------------
+
+const int RIGHT_FRAME_1[SERVO_COUNT] = {
+  36, 120, 45, 60, 90,
+  100, 90, 135, 50, 56
+};
+
+
+// ------------------------------------------------------------
+// R2 = LIFT RIGHT LEG
+// ------------------------------------------------------------
+
+const int RIGHT_FRAME_2[SERVO_COUNT] = {
+  36, 120, 45, 60, 90,
+  100, 115, 160, 50, 56
+};
+
+
+// ------------------------------------------------------------
+// R3 = SWING RIGHT LEG FORWARD
+// ------------------------------------------------------------
+
+const int RIGHT_FRAME_3[SERVO_COUNT] = {
+  36, 120, 45, 60, 90,
+  100, 145, 160, 70, 56
+};
+
+
+// ============================================================
+// LEFT LEG GAIT
+// ONLY L1, L2, L3
+// ============================================================
+
+// L0 = DEFAULT / STARTING POSITION
+const int LEFT_FRAME_0[SERVO_COUNT] = {
+  36, 120, 45, 60, 90,
+  100, 145, 160, 70, 56
+};
+
+
+// ------------------------------------------------------------
+// L1 = SHIFT BODY RIGHT
+// ------------------------------------------------------------
+
+const int LEFT_FRAME_1[SERVO_COUNT] = {
+  36, 80, 45, 40, 90,
+  100, 120, 160, 70, 65
+};
+
+
+// ------------------------------------------------------------
+// L2 = LIFT LEFT LEG
+// ------------------------------------------------------------
+
+const int LEFT_FRAME_2[SERVO_COUNT] = {
+  36, 80, 45, 40, 90,
+  100, 120, 160, 70, 65
+};
+
+
+// ------------------------------------------------------------
+// L3 = SWING LEFT LEG FORWARD
+// ------------------------------------------------------------
+
+const int LEFT_FRAME_3[SERVO_COUNT] = {
+  36, 80, 45, 40, 90,
+  100, 120, 160, 70, 65
+};
+
+
+
+// ============================================================
+// CURRENT SERVO POSITIONS
+// ============================================================
+
+int commandedAngle[SERVO_COUNT];
+
+
+// ============================================================
+// SELECTED SERVO
+// ============================================================
+
+int selectedServo = 0;
+
+bool waitingForServoNumber = false;
+
+
+// ============================================================
+// SERIAL INPUT
+// ============================================================
+
+String inputLine;
+
+
+// ============================================================
+// ANGLE -> PCA9685 TICKS
+// ============================================================
+
+uint16_t angleToTicks(int angle) {
+
+  angle = constrain(angle, 0, 180);
+
+  const uint16_t pulseUs = map(
+    angle,
+    0,
+    180,
+    SERVO_MIN_US,
+    SERVO_MAX_US
+  );
+
+  return static_cast<uint32_t>(pulseUs)
+         * 4096UL
+         / 20000UL;
+}
+
+
+// ============================================================
+// WRITE SERVO
+// ============================================================
+
+void writeServoAngle(
+  uint8_t servo,
+  int angle
+) {
+
+  angle = constrain(angle, 0, 180);
+
+  pwm.setPWM(
+    servo,
+    0,
+    angleToTicks(angle)
+  );
+}
+
+
+// ============================================================
+// MOVE ONE SERVO
+// ============================================================
+
+void moveServo(
+  uint8_t servo,
+  int targetAngle
+) {
+
+  targetAngle = constrain(
+    targetAngle,
+    0,
+    180
+  );
+
+
+  // ----------------------------------------------------------
+  // If servo has never been commanded
+  // ----------------------------------------------------------
+
+  if (commandedAngle[servo] < 0) {
+
+    writeServoAngle(
+      servo,
+      targetAngle
+    );
+
+    commandedAngle[servo] =
+      targetAngle;
+
+    Serial.printf(
+      "Servo %u commanded to %d degrees.\n",
+      servo,
+      targetAngle
+    );
+
+    return;
+  }
+
+
+  int currentAngle =
+    commandedAngle[servo];
+
+
+  // ----------------------------------------------------------
+  // Move gradually
+  // ----------------------------------------------------------
+
+  while (
+    currentAngle != targetAngle
+  ) {
+
+    if (
+      currentAngle < targetAngle
+    ) {
+
+      currentAngle +=
+        MOVE_STEP_DEGREES;
+
+      if (
+        currentAngle > targetAngle
+      ) {
+
+        currentAngle =
+          targetAngle;
+      }
+
+    }
+    else {
+
+      currentAngle -=
+        MOVE_STEP_DEGREES;
+
+      if (
+        currentAngle < targetAngle
+      ) {
+
+        currentAngle =
+          targetAngle;
+      }
+    }
+
+
+    writeServoAngle(
+      servo,
+      currentAngle
+    );
+
+
+    commandedAngle[servo] =
+      currentAngle;
+
+
+    delay(
+      MOVE_STEP_DELAY_MS
+    );
+  }
+
+
+  commandedAngle[servo] =
+    targetAngle;
+
+
+  Serial.printf(
+    "Servo %u commanded to %d degrees.\n",
+    servo,
+    targetAngle
+  );
+}
+
+
+// ============================================================
+// MOVE ALL SERVOS TO POSE
+// ============================================================
+
+void moveToPose(
+  const int targetPose[SERVO_COUNT],
+  const char* frameName
+) {
+
+  Serial.println();
+  Serial.println("----------------------------------------");
+
+  Serial.print(
+    "MOVING TO: "
+  );
+
+  Serial.println(
+    frameName
+  );
+
+  Serial.println("----------------------------------------");
+
+
+  int startAngle[SERVO_COUNT];
+
+
+  // ----------------------------------------------------------
+  // Determine starting positions
+  // ----------------------------------------------------------
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    if (
+      commandedAngle[servo] < 0
+    ) {
+
+      startAngle[servo] =
+        targetPose[servo];
+
+    }
+    else {
+
+      startAngle[servo] =
+        commandedAngle[servo];
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Find largest movement
+  // ----------------------------------------------------------
+
+  int maxDifference = 0;
+
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    int difference =
+      abs(
+        targetPose[servo]
+        -
+        startAngle[servo]
+      );
+
+
+    if (
+      difference > maxDifference
+    ) {
+
+      maxDifference =
+        difference;
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Already at target
+  // ----------------------------------------------------------
+
+  if (
+    maxDifference == 0
+  ) {
+
+    for (
+      uint8_t servo = 0;
+      servo < SERVO_COUNT;
+      servo++
+    ) {
+
+      commandedAngle[servo] =
+        targetPose[servo];
+
+      writeServoAngle(
+        servo,
+        targetPose[servo]
+      );
+    }
+
+
+    Serial.println(
+      "Already at this frame."
+    );
+
+
+    delay(
+      GAIT_FRAME_DELAY_MS
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // MOVE ALL SERVOS TOGETHER
+  // ----------------------------------------------------------
+
+  for (
+    int step = 1;
+    step <= maxDifference;
+    step++
+  ) {
+
+    for (
+      uint8_t servo = 0;
+      servo < SERVO_COUNT;
+      servo++
+    ) {
+
+      int difference =
+        targetPose[servo]
+        -
+        startAngle[servo];
+
+
+      int newAngle =
+        startAngle[servo]
+        +
+        (
+          difference * step
+        )
+        /
+        maxDifference;
+
+
+      newAngle =
+        constrain(
+          newAngle,
+          0,
+          180
+        );
+
+
+      writeServoAngle(
+        servo,
+        newAngle
+      );
+
+
+      commandedAngle[servo] =
+        newAngle;
+    }
+
+
+    // Delay between every degree
+    delay(
+      MOVE_STEP_DELAY_MS
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Ensure exact final values
+  // ----------------------------------------------------------
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    commandedAngle[servo] =
+      targetPose[servo];
+
+    writeServoAngle(
+      servo,
+      targetPose[servo]
+    );
+  }
+
+
+  Serial.println(
+    "Frame reached."
+  );
+
+
+  // ----------------------------------------------------------
+  // SETTLING DELAY
+  // ----------------------------------------------------------
+
+  Serial.print(
+    "Settling for "
+  );
+
+  Serial.print(
+    GAIT_FRAME_DELAY_MS
+  );
+
+  Serial.println(
+    " ms..."
+  );
+
+
+  delay(
+    GAIT_FRAME_DELAY_MS
+  );
+}
+
+
+// ============================================================
+// DEFAULT POSE
+// ============================================================
+
+void goToDefaultPose() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       DEFAULT KP17 POSE");
+  Serial.println("========================================");
+
+
+  moveToPose(
+    KP_DEFAULT_POSE,
+    "DEFAULT KP17"
+  );
+
+
+  Serial.println(
+    "DEFAULT POSE REACHED."
+  );
+}
+
+
+// ============================================================
+// SEQUENTIAL STATE
+//
+// q
+//
+// 1. Servo 6 -> 120
+// 2. Servo 7 -> 160
+// 3. Servo 3 -> 110
+// 4. Servo 2 -> 70
+//
+// ONE SERVO AT A TIME
+// BIG DELAY BETWEEN EACH
+// ============================================================
+
+void sequentialState() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("          SEQUENTIAL STATE");
+  Serial.println("========================================");
+
+
+  // ----------------------------------------------------------
+  // STEP 1
+  // Servo 6 -> 120
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "STEP 1: Servo 6 -> 120"
+  );
+
+  moveServo(
+    6,
+    120
+  );
+
+  Serial.print(
+    "Waiting "
+  );
+
+  Serial.print(
+    SEQUENTIAL_DELAY_MS
+  );
+
+  Serial.println(
+    " ms..."
+  );
+
+  delay(
+    SEQUENTIAL_DELAY_MS
+  );
+
+
+  // ----------------------------------------------------------
+  // STEP 2
+  // Servo 7 -> 160
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "STEP 2: Servo 7 -> 160"
+  );
+
+  moveServo(
+    7,
+    160
+  );
+
+  Serial.print(
+    "Waiting "
+  );
+
+  Serial.print(
+    SEQUENTIAL_DELAY_MS
+  );
+
+  Serial.println(
+    " ms..."
+  );
+
+  delay(
+    SEQUENTIAL_DELAY_MS
+  );
+
+
+  // ----------------------------------------------------------
+  // STEP 3
+  // Servo 3 -> 110
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "STEP 3: Servo 3 -> 110"
+  );
+
+  moveServo(
+    3,
+    110
+  );
+
+  Serial.print(
+    "Waiting "
+  );
+
+  Serial.print(
+    SEQUENTIAL_DELAY_MS
+  );
+
+  Serial.println(
+    " ms..."
+  );
+
+  delay(
+    SEQUENTIAL_DELAY_MS
+  );
+
+
+  // ----------------------------------------------------------
+  // STEP 4
+  // Servo 2 -> 70
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "STEP 4: Servo 2 -> 70"
+  );
+
+  moveServo(
+    2,
+    70
+  );
+
+  Serial.print(
+    "Waiting "
+  );
+
+  Serial.print(
+    SEQUENTIAL_DELAY_MS
+  );
+
+  Serial.println(
+    " ms..."
+  );
+
+  delay(
+    SEQUENTIAL_DELAY_MS
+  );
+
+
+  // ----------------------------------------------------------
+  // COMPLETE
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "SEQUENTIAL STATE COMPLETE."
+  );
+
+  printPose();
+}
+
+
+// ============================================================
+// RIGHT LEG STEP
+//
+// R1 -> R2 -> R3
+// ============================================================
+
+void rightLegStep() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("          RIGHT LEG STEP");
+  Serial.println("========================================");
+
+  // ----------------------------------------------------------
+  // R1
+  // ----------------------------------------------------------
+
+  moveToPose(
+    RIGHT_FRAME_1,
+    "R1 - SHIFT LEFT"
+  );
+
+
+  // ----------------------------------------------------------
+  // R2
+  // ----------------------------------------------------------
+
+  moveToPose(
+    RIGHT_FRAME_2,
+    "R2 - LIFT RIGHT LEG"
+  );
+
+
+  // ----------------------------------------------------------
+  // R3
+  // ----------------------------------------------------------
+
+  moveToPose(
+    RIGHT_FRAME_3,
+    "R3 - SWING RIGHT FORWARD"
+  );
+
+
+  // ----------------------------------------------------------
+  // RETURN
+  // Bring left leg closer to right leg
+  // Keep right leg in place
+  // ----------------------------------------------------------
+
+
+
+
+  Serial.println();
+  Serial.println(
+    "RIGHT LEG MOVEMENT + RETURN COMPLETE."
+  );
+}
+
+
+// ============================================================
+// LEFT LEG STEP
+//
+// L1 -> L2 -> L3
+// ============================================================
+
+void leftLegStep() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("           LEFT LEG STEP");
+  Serial.println("========================================");
+
+
+  // ----------------------------------------------------------
+  // L1
+  // ----------------------------------------------------------
+
+  moveToPose(
+    LEFT_FRAME_1,
+    "L1 - SHIFT RIGHT"
+  );
+
+
+  // ----------------------------------------------------------
+  // L2
+  // ----------------------------------------------------------
+
+  moveToPose(
+    LEFT_FRAME_2,
+    "L2 - LIFT LEFT LEG"
+  );
+
+
+  // ----------------------------------------------------------
+  // L3
+  // ----------------------------------------------------------
+
+  moveToPose(
+    LEFT_FRAME_3,
+    "L3 - SWING LEFT FORWARD"
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "LEFT LEG L1-L3 COMPLETE."
+  );
+}
+
+
+// ============================================================
+// FULL WALK
+//
+// RIGHT: R1 -> R2 -> R3
+// LEFT : L1 -> L2 -> L3
+// ============================================================
+
+void walk() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             START WALKING");
+  Serial.println("========================================");
+
+
+  // ----------------------------------------------------------
+  // RIGHT LEG
+  // ----------------------------------------------------------
+
+  rightLegStep();
+
+
+  delay(
+    GAIT_FRAME_DELAY_MS
+  );
+
+
+  // ----------------------------------------------------------
+  // LEFT LEG
+  // ----------------------------------------------------------
+
+  leftLegStep();
+
+
+  delay(
+    GAIT_FRAME_DELAY_MS
+  );
+
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             WALK COMPLETE");
+  Serial.println("========================================");
+}
+
+
+// ============================================================
+// PRINT CURRENT POSE
+// ============================================================
+
+void printPose() {
+
+  Serial.println();
+  Serial.println(
+    "CURRENT COMMANDED POSE"
+  );
+
+  Serial.println(
+    "-----------------------"
+  );
+
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    Serial.printf(
+      "Servo %u: ",
+      servo
+    );
+
+
+    if (
+      commandedAngle[servo] < 0
+    ) {
+
+      Serial.println(
+        "not commanded"
+      );
+
+    }
+    else {
+
+      Serial.printf(
+        "%d degrees\n",
+        commandedAngle[servo]
+      );
+    }
+  }
+
+
+  Serial.println();
+
+  Serial.print(
+    "Copyable array: {"
+  );
+
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    if (
+      commandedAngle[servo] < 0
+    ) {
+
+      Serial.print(
+        "-1"
+      );
+
+    }
+    else {
+
+      Serial.print(
+        commandedAngle[servo]
+      );
+    }
+
+
+    if (
+      servo < SERVO_COUNT - 1
+    ) {
+
+      Serial.print(
+        ", "
+      );
+    }
+  }
+
+
+  Serial.println(
+    "}"
+  );
+
+  Serial.println();
+}
+
+
+// ============================================================
+// DISABLE ONE SERVO
+// ============================================================
+
+void disableServo(
+  uint8_t servo
+) {
+
+  pwm.setPin(
+    servo,
+    0
+  );
+
+
+  commandedAngle[servo] =
+    -1;
+
+
+  Serial.printf(
+    "Servo %u disabled.\n",
+    servo
+  );
+}
+
+
+// ============================================================
+// DISABLE ALL SERVOS
+// ============================================================
+
+void disableAllServos() {
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    pwm.setPin(
+      servo,
+      0
+    );
+
+
+    commandedAngle[servo] =
+      -1;
+  }
+
+
+  Serial.println(
+    "All servos disabled."
+  );
+}
+
+
+// ============================================================
+// HELP MENU
+// ============================================================
+
+void printHelp() {
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             KP17 COMMANDS");
+  Serial.println("========================================");
+
+  Serial.println();
+
+  Serial.println(
+    "d       Go to default KP17 pose"
+  );
+
+  Serial.println(
+    "r       RIGHT leg: R1 -> R2 -> R3"
+  );
+
+  Serial.println(
+    "l       LEFT leg: L1 -> L2 -> L3"
+  );
+
+  Serial.println(
+    "w       RIGHT + LEFT walking cycle"
+  );
+
+  Serial.println(
+    "q       Sequential state"
+  );
+
+  Serial.println(
+    "p       Print current servo angles"
+  );
+
+  Serial.println(
+    "sel     Select a servo"
+  );
+
+  Serial.println(
+    "x       Disable selected servo"
+  );
+
+  Serial.println(
+    "xa      Disable all servos"
+  );
+
+  Serial.println(
+    "h       Print help"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "Servo testing:"
+  );
+
+  Serial.println(
+    "sel 4"
+  );
+
+  Serial.println(
+    "Then enter angle 0-180"
+  );
+
+  Serial.println();
+
+  Serial.printf(
+    "Selected servo: %d\n",
+    selectedServo
+  );
+
+  Serial.println();
+}
+
+
+// ============================================================
+// PARSE INTEGER
+// ============================================================
+
+bool parseInteger(
+  const String& text,
+  int& result
+) {
+
+  if (
+    text.length() == 0
+  ) {
+
+    return false;
+  }
+
+
+  char* endPointer =
+    nullptr;
+
+
+  const long value =
+    strtol(
+      text.c_str(),
+      &endPointer,
+      10
+    );
+
+
+  if (
+    *endPointer != '\0'
+  ) {
+
+    return false;
+  }
+
+
+  result =
+    static_cast<int>(
+      value
+    );
+
+
+  return true;
+}
+
+
+// ============================================================
+// PROCESS COMMAND
+// ============================================================
+
+void processCommand(
+  String command
+) {
+
+  command.trim();
+
+  command.toLowerCase();
+
+
+  if (
+    command.length() == 0
+  ) {
+
+    return;
+  }
+
+
+  // ==========================================================
+  // SEQUENTIAL STATE
+  // q
+  // ==========================================================
+
+  if (
+    command == "q"
+  ) {
+
+    waitingForServoNumber =
+      false;
+
+
+    sequentialState();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // RIGHT LEG
+  // r
+  // ==========================================================
+
+  if (
+    command == "r"
+  ) {
+
+    waitingForServoNumber =
+      false;
+
+
+    rightLegStep();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // LEFT LEG
+  // l
+  // ==========================================================
+
+  if (
+    command == "l"
+  ) {
+
+    waitingForServoNumber =
+      false;
+
+
+    leftLegStep();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // WALK
+  // w
+  // ==========================================================
+
+  if (
+    command == "w"
+  ) {
+
+    waitingForServoNumber =
+      false;
+
+
+    walk();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // DEFAULT
+  // d
+  // ==========================================================
+
+  if (
+    command == "d"
+  ) {
+
+    waitingForServoNumber =
+      false;
+
+
+    goToDefaultPose();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // WAITING FOR SERVO NUMBER
+  // ==========================================================
+
+  if (
+    waitingForServoNumber
+  ) {
+
+    int servoNumber;
+
+
+    if (
+      !parseInteger(
+        command,
+        servoNumber
+      )
+      ||
+      servoNumber < 0
+      ||
+      servoNumber >= SERVO_COUNT
+    ) {
+
+      Serial.println(
+        "Enter a servo number from 0 to 9."
+      );
+
+      return;
+    }
+
+
+    selectedServo =
+      servoNumber;
+
+
+    waitingForServoNumber =
+      false;
+
+
+    Serial.printf(
+      "Selected servo %d.\n",
+      selectedServo
+    );
+
+
+    Serial.println(
+      "Enter an angle from 0 to 180."
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // SELECT SERVO
+  // sel
+  // ==========================================================
+
+  if (
+    command == "sel"
+  ) {
+
+    waitingForServoNumber =
+      true;
+
+
+    Serial.println(
+      "Enter servo number 0 to 9."
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // SELECT SERVO DIRECTLY
+  //
+  // Example:
+  // sel 4
+  // ==========================================================
+
+  if (
+    command.startsWith("sel ")
+  ) {
+
+    String servoText =
+      command.substring(4);
+
+
+    servoText.trim();
+
+
+    int servoNumber;
+
+
+    if (
+      !parseInteger(
+        servoText,
+        servoNumber
+      )
+      ||
+      servoNumber < 0
+      ||
+      servoNumber >= SERVO_COUNT
+    ) {
+
+      Serial.println(
+        "Servo number must be from 0 to 9."
+      );
+
+
+      return;
+    }
+
+
+    selectedServo =
+      servoNumber;
+
+
+    Serial.printf(
+      "Selected servo %d.\n",
+      selectedServo
+    );
+
+
+    Serial.println(
+      "Enter an angle from 0 to 180."
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // PRINT POSE
+  // p
+  // ==========================================================
+
+  if (
+    command == "p"
+  ) {
+
+    printPose();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // DISABLE SELECTED SERVO
+  // x
+  // ==========================================================
+
+  if (
+    command == "x"
+  ) {
+
+    disableServo(
+      selectedServo
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // DISABLE ALL
+  // xa
+  // ==========================================================
+
+  if (
+    command == "xa"
+  ) {
+
+    disableAllServos();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // HELP
+  // h
+  // ==========================================================
+
+  if (
+    command == "h"
+  ) {
+
+    printHelp();
+
+    return;
+  }
+
+
+  // ==========================================================
+  // ANGLE COMMAND
+  // ==========================================================
+
+  int angle;
+
+
+  if (
+    !parseInteger(
+      command,
+      angle
+    )
+    ||
+    angle < 0
+    ||
+    angle > 180
+  ) {
+
+    Serial.println(
+      "Invalid command."
+    );
+
+    Serial.println(
+      "Type h for help."
+    );
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Move selected servo
+  // ----------------------------------------------------------
+
+  moveServo(
+    selectedServo,
+    angle
+  );
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(500);
+
+
+  // ----------------------------------------------------------
+  // Initialize positions
+  // ----------------------------------------------------------
+
+  for (
+    uint8_t servo = 0;
+    servo < SERVO_COUNT;
+    servo++
+  ) {
+
+    commandedAngle[servo] =
+      -1;
+  }
+
+
+  // ----------------------------------------------------------
+  // Start I2C
+  // ----------------------------------------------------------
+
+  if (
+    !Wire.begin(
+      SDA_PIN,
+      SCL_PIN,
+      400000
+    )
+  ) {
+
+    Serial.println(
+      "ERROR: Could not start I2C."
+    );
+
+
+    while (true) {
+
+      delay(1000);
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Start PCA9685
+  // ----------------------------------------------------------
+
+  if (
+    !pwm.begin()
+  ) {
+
+    Serial.println(
+      "ERROR: PCA9685 not found."
+    );
+
+
+    while (true) {
+
+      delay(1000);
+    }
+  }
+
+
+  pwm.setPWMFreq(
+    SERVO_FREQUENCY_HZ
+  );
+
+
+  delay(20);
+
+
+  // ----------------------------------------------------------
+  // Start with servos disabled
+  // ----------------------------------------------------------
+
+  disableAllServos();
+
+
+  // ----------------------------------------------------------
+  // Startup message
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    "          KP17 GAIT CONTROLLER"
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+
+  Serial.println();
+
+
+  Serial.println(
+    "Default pose:"
+  );
+
+
+  Serial.println(
+    "42 120 45 80 90 100 90 135 50 60"
+  );
+
+
+  Serial.println();
+
+
+  Serial.print(
+    "Normal frame delay: "
+  );
+
+  Serial.print(
+    GAIT_FRAME_DELAY_MS
+  );
+
+  Serial.println(
+    " ms"
+  );
+
+
+  Serial.print(
+    "Sequential delay: "
+  );
+
+  Serial.print(
+    SEQUENTIAL_DELAY_MS
+  );
+
+  Serial.println(
+    " ms"
+  );
+
+
+  printHelp();
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  while (
+    Serial.available() > 0
+  ) {
+
+    const char character =
+      Serial.read();
+
+
+    // --------------------------------------------------------
+    // Process when Enter is pressed
+    // --------------------------------------------------------
+
+    if (
+      character == '\n' ||
+      character == '\r'
+    ) {
+
+      if (
+        inputLine.length() > 0
+      ) {
+
+        processCommand(
+          inputLine
+        );
+
+
+        inputLine =
+          "";
+      }
+
+    }
+    else {
+
+      inputLine +=  
+        character;
+
+
+      if (
+        inputLine.length() > 32
+      ) {
+
+        inputLine =
+          "";
+
+
+        Serial.println(
+          "Input too long."
+        );
+      }
+    }
+  }
+}
